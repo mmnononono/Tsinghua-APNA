@@ -1,0 +1,61 @@
+function [A, B] = My_makeAB(system, link_branch_set, ref_node)
+
+nodes    = size(system.bus, 1);
+branches = size(system.branch, 1);
+
+from_nodes = system.branch(:,1);
+to_nodes   = system.branch(:,2);
+
+%构造节点-支路矩阵 A
+A_full = sparse([from_nodes; to_nodes], ...
+                [1:branches, 1:branches], ...
+                [ones(branches,1); -ones(branches,1)], ...
+                nodes, branches);
+
+A = A_full;
+if ref_node > 0 && ref_node <= nodes
+    A(ref_node,:) = [];   % 去掉参考节点行
+end
+
+% 树支/连支划分
+link_idx = link_branch_set(:);
+tree_idx = setdiff(1:branches, link_idx);
+
+% 构造生成树图
+G = graph(from_nodes, to_nodes);
+T = minspantree(G,'Type','forest','Root',ref_node);
+
+% 构造回路-支路矩阵 B
+num_links = length(link_idx);
+B = zeros(num_links, branches);
+
+for k = 1:num_links
+    link = link_idx(k);
+    u = from_nodes(link);
+    v = to_nodes(link);
+
+    % 环路方向固定为：u -> v (连支方向)，再通过树支 v->u 回路
+    path = shortestpath(T, v, u);
+
+    % 遍历树路径
+    for p = 1:(length(path)-1)
+        i = path(p);
+        j = path(p+1);
+
+        % 找出该树支在 branch 中的编号
+        bidx = find((from_nodes==i & to_nodes==j) | ...
+                    (from_nodes==j & to_nodes==i), 1);
+
+        % 确定方向：与 (i->j) 一致 +1，反向 -1
+        if from_nodes(bidx)==i && to_nodes(bidx)==j
+            B(k,bidx) = 1;
+        else
+            B(k,bidx) = -1;
+        end
+    end
+
+    % 连支本身固定为 +1
+    B(k, link) = 1;
+end
+
+end
