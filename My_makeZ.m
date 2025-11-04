@@ -1,106 +1,140 @@
 function Z = My_makeZ(system)
-% My_makeZ — 基于"对地支路初始化 + 连支追加"的节点阻抗矩阵生成
-% 说明：
-%   - 若 system.EPS_G 存在则采用；否则默认 1e-9
-%   - 若 system.coupled_groups 存在则做 rank-m Woodbury；否则逐条 rank-1
 
-    % ===== 阻尼设置（可调） =====
-   
-        EPS_G = 1e-8;
-   
+BUS_I=1; GS=5; BS=6; F_BUS=1; T_BUS=2; BR_R=3; BR_X=4; BR_B=5; TAP=9; SHIFT=10; BR_STATUS=11;
 
-    % ===== 索引常量 =====
-    define_constants;  % BUS_I, GS, BS, F_BUS, T_BUS, BR_R, BR_X, BR_B, TAP, SHIFT, BR_STATUS
+baseMVA = system.baseMVA;
+bus     = system.bus;
+branch  = system.branch;
+nb = size(bus,1); nl = size(branch,1); ncol = size(branch,2);
 
-    baseMVA = system.baseMVA;
-    bus     = system.bus;
-    branch  = system.branch;
+tap = ones(nl,1);
+if ncol >= TAP
+    t = branch(:,TAP); nz = isfinite(t) & (t~=0); tap(nz)=t(nz);
+end
+shift_deg = zeros(nl,1);
+if ncol >= SHIFT
+    s = branch(:,SHIFT); s(isnan(s))=0; shift_deg=s;
+end
+on = true(nl,1);
+if ncol >= BR_STATUS
+    on = branch(:,BR_STATUS)>0;
+end
 
-    nb = size(bus,1);
-    nl = size(branch,1);
+%接地支路
+ground_bus_id = max(bus(:,BUS_I)) + 1;
+added_rows = {};
 
-    % ===== (A) 初始化 Z^(0) = diag(1./y_sh) =====
-    ysh = complex(zeros(nb,1));
-
-    % 1) 母线并联导纳（与地）
-    ysh = ysh + (bus(:,GS) + 1j*bus(:,BS)) / baseMVA;
-
-    % 2) 线路两端充电电纳一半（各自对地）
-    on  = branch(:,BR_STATUS) > 0;
-    if any(on)
-        f_on  = branch(on, F_BUS);
-        t_on  = branch(on, T_BUS);
-        Bb_on = branch(on, BR_B);
-        y_half = 1j * Bb_on / 2;
-        for k = 1:numel(y_half)
-            ysh(f_on(k)) = ysh(f_on(k)) + y_half(k);
-            ysh(t_on(k)) = ysh(t_on(k)) + y_half(k);
+% Gs/Bs
+if size(bus,2) >= max(GS,BS)
+    for i=1:nb
+        Yg=(bus(i,GS)+1i*bus(i,BS))/baseMVA;
+        if abs(Yg)>0
+            Zg=1/Yg; r=zeros(1,ncol);
+            r([F_BUS T_BUS BR_R BR_X])=[bus(i,BUS_I) ground_bus_id real(Zg) imag(Zg)];
+            if ncol>=BR_STATUS, r(BR_STATUS)=1; end
+            added_rows{end+1}=r;
         end
-    end
-
-    % 防止零地导纳（数值稳健）
-    ysh = ysh + EPS_G;
-
-    Z = spdiags(1 ./ ysh, 0, nb, nb);  % 初始对角 Z
-
-    % ===== (B) 追加"连支" =====
-    coupled_groups = {};
-    if isfield(system, 'coupled_groups') && ~isempty(system.coupled_groups)
-        coupled_groups = system.coupled_groups;
-    end
-
-    % 标记耦合支路，避免重复
-    coupled_mask = false(nl,1);
-    for g = 1:numel(coupled_groups)
-        members = coupled_groups{g}.members(:);
-        assert(all(members>=1 & members<=nl), 'coupled members 越界');
-        coupled_mask(members) = true;
-    end
-
-    % —— 无耦合：逐条 rank-1
-    on_uncoupled = on & ~coupled_mask;
-    if any(on_uncoupled)
-        idx = find(on_uncoupled).';
-        for k = idx
-            z = complex(branch(k,BR_R), branch(k,BR_X));
-            if ~isfinite(z) || z == 0, continue; end
-            M = make_M_vector(nb, branch(k,:), F_BUS, T_BUS, TAP, SHIFT);
-
-            ZM = Z * M;
-            S  = z + (M.' * ZM);            % 标量
-            if ~isfinite(S) || abs(S) == 0, continue; end
-            Z  = Z - (ZM * (ZM.')) / S;
-        end
-    end
-
-    % —— 耦合组：rank-m Woodbury
-    for g = 1:numel(coupled_groups)
-        grp = coupled_groups{g};
-        members = grp.members(:).';
-        Zb = grp.Zb;
-
-        assert(all(on(members)), '耦合组包含未投运支路');
-        m = numel(members);
-        assert(all(size(Zb)==[m,m]), 'Zb 尺寸必须为 m×m');
-
-        Mb = complex(zeros(nb,m));
-        for j = 1:m
-            Mb(:,j) = make_M_vector(nb, branch(members(j),:), F_BUS, T_BUS, TAP, SHIFT);
-        end
-
-        ZMb = Z * Mb;
-        S   = Zb + (Mb.' * ZMb);
-        X   = S \ (ZMb.');
-        Z   = Z - ZMb * X;
     end
 end
 
-function M = make_M_vector(nb, br, F_BUS, T_BUS, TAP, SHIFT)
-    f = br(F_BUS);  t = br(T_BUS);
-    tap   = br(TAP);   if tap==0 || ~isfinite(tap), tap = 1; end
-    shift = br(SHIFT); if ~isfinite(shift), shift = 0; end
-    a = tap * exp(1j * deg2rad(shift));
-    M    = complex(zeros(nb,1));
-    M(f) =  1 / a;
-    M(t) = -1;
+% 充电电纳 B/2
+if size(branch,2) >= BR_B
+    for k=1:nl
+        if branch(k,BR_B)~=0
+            Yc=1i*branch(k,BR_B)/2; Zc=1/Yc;
+            rf=zeros(1,ncol); rf([F_BUS T_BUS BR_R BR_X])=[branch(k,F_BUS) ground_bus_id real(Zc) imag(Zc)];
+            if ncol>=BR_STATUS, rf(BR_STATUS)=1; end
+            added_rows{end+1}=rf;
+            rt=rf; rt(F_BUS)=branch(k,T_BUS); added_rows{end+1}=rt;
+        end
+    end
+end
+
+branchE = branch;
+if ~isempty(added_rows)
+    branchE = [vertcat(added_rows{:}); branch];
+end
+
+f=int32(branchE(:,F_BUS)); t=int32(branchE(:,T_BUS));
+zser=complex(branchE(:,BR_R),branchE(:,BR_X));
+tapE=[ones(size(branchE,1)-nl,1); tap];
+shiftE=[zeros(size(branchE,1)-nl,1); shift_deg];
+aE=tapE.*exp(1i*pi/180*shiftE);
+onE=[true(size(branchE,1)-nl,1); on];
+
+%初始化 
+Z=complex(0);
+node_pos=containers.Map('KeyType','int32','ValueType','int32');
+node_pos(ground_bus_id)=1;
+applied=false(size(branchE,1),1);
+
+    function add_tree_edge(k, known, newb, a)
+        n=size(Z,1); ZN=complex(zeros(n+1,n+1)); ZN(1:n,1:n)=Z;
+        ki=node_pos(known);
+        if known==f(k)
+            ZN(1:n,n+1)=Z(1:n,ki)/a; ZN(n+1,1:n)=Z(ki,1:n)/a;
+            ZN(n+1,n+1)=zser(k)+Z(ki,ki)/(a^2);
+        else
+            ZN(1:n,n+1)=Z(1:n,ki)*a; ZN(n+1,1:n)=Z(ki,1:n)*a;
+            ZN(n+1,n+1)=(a^2)*(Z(ki,ki)+zser(k));
+        end
+        Z=ZN; node_pos(newb)=n+1;
+    end
+
+    function add_link_edge(k,a)
+        fi=node_pos(f(k)); tj=node_pos(t(k));
+        M=complex(zeros(size(Z,1),1)); M(fi)=1/a; M(tj)=-1;
+        v=Z*M; S=zser(k)+(M.'*v); Z=Z-(v*v.')/S;
+    end
+
+% 树支 
+changed=true;
+while changed
+    changed=false;
+    for k=1:size(branchE,1)
+        if applied(k)||~onE(k), continue; end
+        i=f(k); j=t(k);
+        if xor(i==ground_bus_id,j==ground_bus_id)
+            other=i; if i==ground_bus_id, other=j; end
+            if ~isKey(node_pos,other)
+                add_tree_edge(k,ground_bus_id,other,aE(k));
+                applied(k)=true; changed=true;
+            end
+        end
+    end
+end
+
+%  扩展树
+changed=true;
+while changed
+    changed=false;
+    for k=1:size(branchE,1)
+        if applied(k)||~onE(k), continue; end
+        i=f(k); j=t(k); ci=isKey(node_pos,i); cj=isKey(node_pos,j);
+        if xor(ci,cj)
+            known=i; newb=j; if ~ci&&cj, known=j; newb=i; end
+            add_tree_edge(k,known,newb,aE(k));
+            applied(k)=true; changed=true;
+        end
+    end
+end
+
+% 连支 
+for k=1:size(branchE,1)
+    if applied(k)||~onE(k), continue; end
+    if isKey(node_pos,f(k))&&isKey(node_pos,t(k))
+        add_link_edge(k,aE(k)); applied(k)=true;
+    end
+end
+
+% 重排输出 
+ids=int32(system.bus(:,BUS_I)); n0=numel(ids);
+Z_out=complex(zeros(n0,n0));
+for p=1:n0
+    ip=node_pos(ids(p));
+    for q=1:n0
+        iq=node_pos(ids(q)); Z_out(p,q)=Z(ip,iq);
+    end
+end
+Z=Z_out;
 end
